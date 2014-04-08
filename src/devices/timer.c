@@ -7,6 +7,7 @@
 #include "threads/interrupt.h"
 #include "threads/synch.h"
 #include "threads/thread.h"
+#include "threads/malloc.h"
 #include "list.h"  
 /* See [8254] for hardware details of the 8254 timer chip. */
 
@@ -31,10 +32,17 @@ static void real_time_sleep (int64_t num, int32_t denom);
 static void real_time_delay (int64_t num, int32_t denom);
 
 // These should both be protected by a mutex
-static struct list tick_list;
-static struct list thread_list;
-// init both lists
+static struct lock list_lock;
+// I received help from Nathan Lintz for list initialization.
+static struct list thread_bed_list = LIST_INITIALIZER(thread_bed_list);
 
+struct thread_bed //somewhere for a thread to sleep
+{
+    int64_t wake_time;
+    struct list_elem list_element;
+    struct thread *thread;
+    struct semaphore pillow;
+};
 
 /* Sets up the timer to interrupt TIMER_FREQ times per second,
    and registers the corresponding interrupt. */
@@ -43,6 +51,7 @@ timer_init (void)
 {
   pit_configure_channel (0, 2, TIMER_FREQ);
   intr_register_ext (0x20, timer_interrupt, "8254 Timer");
+  lock_init(&list_lock);
 }
 
 /* Calibrates loops_per_tick, used to implement brief delays. */
@@ -72,6 +81,28 @@ timer_calibrate (void)
   printf ("%'"PRIu64" loops/s.\n", (uint64_t) loops_per_tick * TIMER_FREQ);
 }
 
+/* Compares the value of two list elements A and B, given
+   auxiliary data AUX.  Returns true if A is less than B, or
+   false if A is greater than or equal to B. */
+bool thread_bed_comparator (const struct list_elem *list_elem_a,
+                             const struct list_elem *list_elem_b,
+                             void *aux){
+  struct thread_bed *a = list_entry (list_elem_a, struct thread_bed,
+                                                list_element);
+
+  struct thread_bed *b = list_entry (list_elem_b, struct thread_bed,
+                                                list_element);
+  if(a->wake_time < b->wake_time){
+    return true;
+  }
+  else{
+    return false;
+  }
+
+}
+
+
+
 /* Returns the number of timer ticks since the OS booted. */
 int64_t
 timer_ticks (void) 
@@ -95,16 +126,30 @@ timer_elapsed (int64_t then)
 void
 timer_sleep (int64_t ticks) 
 {
-  int64_t start = timer_ticks ();
+  ASSERT (intr_get_level () == INTR_ON);
+
+  intr_disable(); // Disable interrupts in the kernal
+  enum intr_level old_level;
+  // struct thread *sleeper = thread_current ();
+  struct thread_bed *bed = malloc(sizeof(struct thread_bed)); 
+  bed->thread = thread_current();
+  bed->wake_time = timer_ticks () + ticks; // time in ticks to be awoken
+  sema_init(&(bed->pillow),0);
+
+  list_insert_ordered (&thread_bed_list,
+                       &(bed->list_element),
+                       thread_bed_comparator,
+                       NULL); 
+
+
+  sema_down(&(bed->pillow));
 
   // Protect this section with a mutex?
   // Add ticks+timer_ticks to ticks_qeue
   // Add thread to thread_queue, sorted by ticks_queue
+  intr_enable(); // Enable interrupts in the kernal
 
 
-  ASSERT (intr_get_level () == INTR_ON);
-  while (timer_elapsed (start) < ticks) 
-    thread_yield ();
 }
 
 /* Sleeps for approximately MS milliseconds.  Interrupts must be
@@ -182,19 +227,36 @@ static void
 timer_interrupt (struct intr_frame *args UNUSED)
 {
   ticks++;
-
-
-  // Get thread_queue/ticks_queue mutex
-  // Check if top of tick_list is ready to be unblocked
-  // If it is:{
-  //    unblock the thread
-  //    remove ticks from list
-  //    remove thread from list
-  //}
-  // else, release mutex. continue.
-
-
   thread_tick ();
+
+
+
+  // So we can't actually wait in a timer_interrupt...
+  // I am worried about thread safety of the list.
+  // I will pretend lock_try_acquire will always succeed
+  // lock_try_acquire(&list_lock);
+
+  struct list_elem *e;
+  struct thread_bed *tb;
+
+  e = list_head (&thread_bed_list);
+  while ((e = list_next (e)) != list_end (&thread_bed_list)) 
+  {
+    tb = list_entry(e, struct thread_bed, list_element);
+    if(tb->wake_time <= ticks){ // it is time to wake the thread up!
+
+
+      sema_up(&(tb->pillow));
+      list_remove(e); // remove from the list
+      free(tb); // free the thread_bed.
+
+    }
+    else{ // Only the first element of the list must be checked
+          // as they are stored sorted.
+      break;
+    }
+  }
+
 }
 
 /* Returns true if LOOPS iterations waits for more than one timer
